@@ -1,0 +1,104 @@
+#version 450
+// PCG scalars and convergence, ONE work group. Sums the partial sums of the work groups, then:
+//   mode 0 (after init)   : rz = r.z, convergence of the initial residual, arguments of the indirect dispatches
+//   mode 1 (alpha)        : alpha = rz / (p.Ap)
+//   mode 2 (beta + check) : beta = rz_new / rz_old, iteration counter, convergence (mean |r| <= tol)
+// ctrl[0..2] = dispatch arguments (0 groups once finished), ctrl[3] = iterations done, ctrl[4] = finished flag.
+// scal[0] = rz, scal[1] = alpha, scal[2] = beta.
+// stats[0] = max speed accumulator (reset here, as sph_solver_check.comp does for the Jacobi solver),
+// stats[1] = number of PCG iterations of the last sub-step.
+layout(local_size_x = 256) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+    vec4 boxMin; vec4 boxMax; vec4 bLo; vec4 gravity;
+    ivec4 gridDim;
+    ivec4 bGridDim;
+    uint numFluid; uint numBoundary; uint maxNeighbors; uint minNbrDiv;
+    float h; float h2; float invH; float kernelK;
+    float kernelL; float W0; float mass; float sFull;
+    float invCell; float restDensity; float viscCoef; float viscEps;
+    float wallDamping; float surfaceNbrThreshold; float pcgRegularization; float pad;
+    vec4 cyl;
+} P;
+
+layout(std430, set = 0, binding = 11) buffer Partials { float partials[]; };
+layout(std430, set = 0, binding = 12) buffer Ctrl { uint ctrl[]; };
+layout(std430, set = 0, binding = 13) buffer Stats { uint stats[]; };
+layout(std430, set = 0, binding = 15) buffer Pcg { float scal[16]; vec2 rp[]; };
+
+layout(push_constant) uniform PC {
+    float dt; float tol; uint divergence; uint minIt; uint maxIt; uint flags; uint mode; float warmFactor;
+} pc;
+
+shared vec4 sh[256];
+
+void main()
+{
+    uint lid = gl_LocalInvocationID.x;
+    uint numGroups = (P.numFluid + 255u) / 256u;
+
+    vec4 s = vec4(0.0);
+    for (uint g = lid; g < numGroups; g += 256u)
+        s += vec4(partials[4u * g], partials[4u * g + 1u], partials[4u * g + 2u], partials[4u * g + 3u]);
+    sh[lid] = s;
+    barrier();
+    for (uint st = 128u; st > 0u; st >>= 1u)
+    {
+        if (lid < st)
+            sh[lid] += sh[lid + st];
+        barrier();
+    }
+
+    if (lid != 0u)
+        return;
+
+    if (pc.mode == 0u)
+    {
+        float nActive = max(sh[0].w, 1.0);      // never 0: avoids a division by zero if no particle is active
+        scal[3] = nActive;
+
+        float avg  = sh[0].y / nActive;
+        bool  done = (avg <= pc.tol);
+        scal[0] = sh[0].x;
+        ctrl[0] = done ? 0u : numGroups;
+        ctrl[1] = 1u;
+        ctrl[2] = 1u;
+        ctrl[3] = 0u;
+        ctrl[4] = done ? 1u : 0u;
+        stats[0] = 0u;
+        stats[1] = 0u;
+        stats[3] = 0u;
+   }
+    else if (ctrl[4] == 0u)
+    {
+        if (pc.mode == 1u)
+        {
+            float pAp = sh[0].z;
+            if (pAp > 1e-30)
+                scal[1] = scal[0] / pAp;
+            else
+            {
+                scal[1] = 0.0;          // breakdown: stop here
+                ctrl[4] = 1u;
+                ctrl[0] = 0u;
+            }
+        }
+        else
+        {
+            float rzNew = sh[0].x;
+            float rzOld = scal[0];
+            float avg   = sh[0].y / max(scal[3], 1.0);
+            scal[2] = (rzOld > 1e-30) ? rzNew / rzOld : 0.0;
+            scal[0] = rzNew;
+
+            uint it = ctrl[3] + 1u;
+            ctrl[3] = it;
+            stats[1] = it;
+            if (avg <= pc.tol || it >= pc.maxIt || !(rzNew > 0.0))
+            {
+                ctrl[4] = 1u;
+                ctrl[0] = 0u;
+            }
+        }
+    }
+}

@@ -1,0 +1,101 @@
+#version 450
+// Explicit position update + safety clamp inside the box (the boundary particles do the real work).
+// Also sanitizes the velocity left by the density solver (clamp, NaN / Inf removal).
+layout(local_size_x = 256) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+
+    vec4 boxMin; vec4 boxMax; vec4 bLo; vec4 gravity;
+    ivec4 gridDim;
+    ivec4 bGridDim;
+    uint numFluid; uint numBoundary; uint maxNeighbors; uint minNbrDiv;
+    float h; float h2; float invH; float kernelK;
+    float kernelL; float W0; float mass; float sFull;
+    float invCell; float restDensity; float viscCoef; float viscEps;
+    float wallDamping; float surfaceNbrThreshold; float pcgRegularization; float pad;
+    vec4 cyl;
+} P;
+
+struct Particle { vec4 pd; vec4 vi; };
+layout(std430, set = 0, binding = 1) buffer Particles { Particle particles[]; };
+
+layout(push_constant) uniform PC {
+    float dt; float tol; uint divergence; uint minIt; uint maxIt; uint first; uint pad0; uint pad1;
+    vec4 curPos; vec4 curVel;       // force cursor (unused here)
+    vec4 piston;                    // x = face position (m), y = velocity (m/s), z = enabled
+} pc;
+
+// NaN / Inf test on the bits: not removed by fast-math optimizations
+bool bad(float x)
+{
+    return (floatBitsToUint(x) & 0x7F800000u) == 0x7F800000u;
+}
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= P.numFluid)
+        return;
+
+    vec3 pos = particles[i].pd.xyz;
+    vec3 vel = particles[i].vi.xyz;
+
+    // Keep the velocities bounded whatever the solver did
+    float speed = length(vel);
+    if (bad(speed))
+        vel = vec3(0.0);
+    else if (speed > P.gravity.w)
+        vel *= P.gravity.w / speed;
+
+    vec3 posPrev = pos;
+    pos += pc.dt * vel;
+
+    // A NaN/Inf particle would poison the grid and its neighbors
+    if (bad(pos.x + pos.y + pos.z))
+    {
+        pos = posPrev;
+        vel = vec3(0.0);
+    }
+    // Safety clamp around the cylinder (the boundary particles do the real work)
+    if (P.cyl.w > 0.5)
+    {
+        vec2  d   = pos.xz - P.cyl.xy;
+        float len = length(d);
+        if (len < P.cyl.z)
+        {
+            vec2 n = (len > 1e-6) ? d / len : vec2(1.0, 0.0);
+            pos.xz = P.cyl.xy + n * P.cyl.z;
+            float vn = dot(vel.xz, n);
+            if (vn < 0.0)
+                vel.xz -= (1.0 + P.wallDamping) * vn * n;       // reflect the inward component, damped
+        }
+    }
+
+    // Wave maker: a particle can never be behind the piston face (safety net, the boundary particles do the real work)
+    if (pc.piston.z > 0.5 && pos.x < pc.piston.x)
+    {
+        pos.x = pc.piston.x;
+        vel.x = max(vel.x, pc.piston.y);
+    }
+
+    vec3 lo = P.boxMin.xyz;
+    vec3 hi = P.boxMax.xyz - vec3(1e-4);        // keeps cell index < gridDim
+    for (int a = 0; a < 3; ++a)
+    {
+        if (pos[a] < lo[a])
+        {
+            pos[a] = lo[a];
+            if (vel[a] < 0.0)
+                vel[a] = -vel[a] * P.wallDamping;
+        }
+        else if (pos[a] > hi[a])
+        {
+            pos[a] = hi[a];
+            if (vel[a] > 0.0)
+                vel[a] = -vel[a] * P.wallDamping;
+        }
+    }
+
+    particles[i].pd.xyz = pos;
+    particles[i].vi.xyz = vel;
+}

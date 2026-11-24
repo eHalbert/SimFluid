@@ -1,0 +1,33 @@
+#version 450
+// Counting sort, pass 3: sorted particles (scratch) -> main particle buffer (the physical order is the cell order).
+layout(local_size_x = 256) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+
+    vec4 boxMin; vec4 boxMax; vec4 bLo; vec4 gravity;
+    ivec4 gridDim;
+    ivec4 bGridDim;
+    uint numFluid; uint numBoundary; uint maxNeighbors; uint minNbrDiv;
+    float h; float h2; float invH; float kernelK;
+    float kernelL; float W0; float mass; float sFull;
+    float invCell; float restDensity; float viscCoef; float viscEps;
+    float wallDamping; float surfaceNbrThreshold; float pcgRegularization; float pad;
+    vec4 cyl;
+} P;
+
+struct Particle { vec4 pd; vec4 vi; };
+layout(std430, set = 0, binding = 1) buffer Particles { Particle particles[]; };
+layout(std430, set = 0, binding = 2) buffer Scratch { Particle scratch[]; };
+layout(std430, set = 0, binding = 10) buffer SolS { float solS[]; };   // sorted warm values (written by scatter)
+layout(std430, set = 0, binding = 14) buffer Warm { float warm[]; };
+
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i < P.numFluid)
+    {
+        particles[i] = scratch[i];
+        warm[i]      = solS[i];     // keep the pressure first guess aligned with the new order
+    }
+}

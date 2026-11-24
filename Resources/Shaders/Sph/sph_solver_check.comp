@@ -1,0 +1,77 @@
+#version 450
+// DFSPH solver convergence check, ONE work group. Sums the per-group errors, then decides on the GPU
+// whether the next iterations run: it writes the indirect dispatch arguments (ctrl[0..2]) used by
+// sph_solver_correct / sph_solver_error. 0 groups = converged (or iteration cap reached).
+//
+// ctrl[0..2] dispatch arguments, ctrl[3] iterations done, ctrl[4] done flag.
+// stats[0] = max speed (float bits, reset here at the first call of the density solver of every sub-step,
+//            filled by sph_finalize.comp), stats[1] = density solver iterations, stats[2] = divergence solver iterations.
+layout(local_size_x = 256) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+    vec4 boxMin; vec4 boxMax; vec4 bLo; vec4 gravity;
+    ivec4 gridDim;
+    ivec4 bGridDim;
+    uint numFluid; uint numBoundary; uint maxNeighbors; uint minNbrDiv;
+    float h; float h2; float invH; float kernelK;
+    float kernelL; float W0; float mass; float sFull;
+    float invCell; float restDensity; float viscCoef; float viscEps;
+    float wallDamping; float surfaceNbrThreshold; float pcgRegularization; float pad;
+} P;
+
+layout(std430, set = 0, binding = 11) buffer Partials { float partials[]; };
+layout(std430, set = 0, binding = 12) buffer Ctrl { uint ctrl[]; };
+layout(std430, set = 0, binding = 13) buffer Stats { uint stats[]; };
+
+layout(push_constant) uniform PC {
+    float dt; float tol; uint divergence; uint minIt; uint maxIt; uint first; uint pad0; uint pad1;
+} pc;
+
+shared float sSum[256];
+
+void main()
+{
+    uint lid = gl_LocalInvocationID.x;
+    uint numGroups = (P.numFluid + 255u) / 256u;
+
+    float s = 0.0;
+    for (uint g = lid; g < numGroups; g += 256u)
+        s += partials[g];
+    sSum[lid] = s;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u)
+    {
+        if (lid < stride)
+            sSum[lid] += sSum[lid + stride];
+        barrier();
+    }
+
+    if (lid == 0u)
+    {
+        float avg  = sSum[0] / float(P.numFluid);
+        uint  iter = (pc.first != 0u) ? 0u : ctrl[3];
+        bool  done = (pc.first == 0u) && (ctrl[4] != 0u);
+
+        if (!done)
+        {
+            bool converged = (iter >= pc.minIt) && (avg <= pc.tol);
+            if (converged || iter >= pc.maxIt)
+                done = true;
+            else
+                ++iter;                 // the correction pass that follows is iteration number 'iter'
+        }
+
+        ctrl[0] = done ? 0u : numGroups;
+        ctrl[1] = 1u;
+        ctrl[2] = 1u;
+        ctrl[3] = iter;
+        ctrl[4] = done ? 1u : 0u;
+
+        stats[1u + pc.divergence] = iter;
+        if (pc.first != 0u && pc.divergence == 0u)
+        {
+            stats[0] = 0u;              // new sub-step: reset the max speed accumulator
+            stats[3] = 0u;              // and the max compression accumulator
+        }
+    }
+}

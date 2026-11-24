@@ -1,0 +1,34 @@
+#version 450
+// Exclusive prefix sum, step 1: scan of each block of 256 elements (in place) and block total in sums[].
+// Used on 3 levels (cell counters -> block sums -> block sums of block sums).
+layout(local_size_x = 256) in;
+
+layout(std430, set = 1, binding = 0) buffer Data { uint data[]; };
+layout(std430, set = 1, binding = 1) buffer Sums { uint sums[]; };
+layout(push_constant) uniform PC { uint n; } pc;
+
+shared uint s[256];
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    uint lid = gl_LocalInvocationID.x;
+
+    uint v = (gid < pc.n) ? data[gid] : 0u;
+    s[lid] = v;
+    barrier();
+
+    // Hillis-Steele inclusive scan
+    for (uint off = 1u; off < 256u; off <<= 1u)
+    {
+        uint t = (lid >= off) ? s[lid - off] : 0u;
+        barrier();
+        s[lid] += t;
+        barrier();
+    }
+
+    if (gid < pc.n)
+        data[gid] = s[lid] - v;                 // exclusive
+    if (lid == 255u)
+        sums[gl_WorkGroupID.x] = s[255];
+}

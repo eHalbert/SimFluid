@@ -1,0 +1,140 @@
+#version 450
+// PCG operator: (A s)_i = dt^2 m^2 * sum_j (D_i - D_j) . grad W_ij, with D from sph_pcg_dir.comp (acc[].xyz, D = 0 on walls).
+// A = dt^2 m^2 D^T D is symmetric positive semi-definite; its diagonal is dt^2 * S_i, so the Jacobi
+// preconditioner is z_i = invS_i / dt^2 * r_i. Inactive particles (see sph_pcg_prep.comp) are excluded.
+//   mode 0 (init)      : b_i = rho*_i - rho0 (rho* = density predicted with the velocities after the forces),
+//                        r = b - A x0, surfaceNbrThreshold = z0. Partial sums: [0] = r.z, [1] = |r|
+//   mode 1 (iteration) : Ap_i -> solS[i]. Partial sum: [2] = p.Ap
+// partials layout: 4 floats per work group.
+layout(local_size_x = 256) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+    vec4 boxMin; vec4 boxMax; vec4 bLo; vec4 gravity;
+    ivec4 gridDim;
+    ivec4 bGridDim;
+    uint numFluid; uint numBoundary; uint maxNeighbors; uint minNbrDiv;
+    float h; float h2; float invH; float kernelK;
+    float kernelL; float W0; float mass; float sFull;
+    float invCell; float restDensity; float viscCoef; float viscEps;
+    float wallDamping; float surfaceNbrThreshold; float pcgRegularization; float pad;
+    vec4 cyl;
+} P;
+
+struct Particle { vec4 pd; vec4 vi; };
+layout(std430, set = 0, binding = 1)  buffer Particles { Particle particles[]; };
+layout(std430, set = 0, binding = 3)  buffer Meta { uvec4 meta[]; };            // z = nbrTotal, w = nbrCount
+layout(std430, set = 0, binding = 5)  buffer NbrIdx { uint nbrIdx[]; };
+layout(std430, set = 0, binding = 6)  buffer NbrGrad { float nbrGrad[]; };
+layout(std430, set = 0, binding = 9)  buffer Acc { vec4 accBuf[]; };
+layout(std430, set = 0, binding = 10) buffer SolS { float solS[]; };            // Ap
+layout(std430, set = 0, binding = 11) buffer Partials { float partials[]; };
+layout(std430, set = 0, binding = 14) buffer Warm { float warmBuf[]; };
+layout(std430, set = 0, binding = 15) buffer Pcg { float scal[16]; vec2 rp[]; };   // rp[i] = (r, p)
+
+layout(push_constant) uniform PC {
+    float dt; float tol; uint divergence; uint minIt; uint maxIt; uint flags; uint mode; float warmFactor;
+    vec4 curPos; vec4 curVel;       // force cursor (unused here)
+    vec4 piston;                    // x = face position (m), y = velocity (m/s), z = enabled
+} pc;
+
+shared vec4 sh[256];
+
+vec3 grad(uint k, uint i)
+{
+    uint o  = k * P.numFluid + i;
+    uint KN = P.maxNeighbors * P.numFluid;
+    return vec3(nbrGrad[o], nbrGrad[KN + o], nbrGrad[2u * KN + o]);
+}
+vec3 boundaryVel(uint j)    // j >= numFluid: static wall (0) or piston
+{
+    return (j >= P.numFluid + P.numBoundary) ? vec3(pc.piston.y, 0.0, 0.0) : vec3(0.0);
+}
+
+bool isActive(uint i)
+{
+    if (particles[i].vi.w <= 0.0)
+        return false;
+    if ((pc.flags & 1u) != 0u && float(meta[i].z) < P.surfaceNbrThreshold)
+        return false;
+    return true;
+}
+
+void main()
+{
+    uint i   = gl_GlobalInvocationID.x;
+    uint lid = gl_LocalInvocationID.x;
+    vec4 sums = vec4(0.0);
+
+    if (i < P.numFluid)
+    {
+        if (isActive(i))
+        {
+            vec3 vi = particles[i].vi.xyz;
+            vec3 Di = accBuf[i].xyz;
+            uint cnt = meta[i].w;
+
+            float delta = 0.0;      // d rho_i / dt / m (init only)
+            float aD    = 0.0;
+            for (uint k = 0u; k < cnt; ++k)
+            {
+                uint j  = nbrIdx[k * P.numFluid + i];
+                vec3 g  = grad(k, i);
+                bool fl = (j < P.numFluid);
+                vec3 Dj = fl ? accBuf[j].xyz : vec3(0.0);
+                aD += dot(Di - Dj, g);
+                if (pc.mode == 0u)
+                {
+                    vec3 vj = fl ? particles[j].vi.xyz : boundaryVel(j);
+                    delta += dot(vi - vj, g);
+                }
+            }
+            float Ax = pc.dt * pc.dt * P.mass * P.mass * aD;
+
+            // Tikhonov regularization: (A + eps * diag(A)) x, with diag(A) = dt^2 * S_i = dt^2 / invS_i
+            float xi = (pc.mode == 0u) ? warmBuf[i] : rp[i].y;
+            Ax += P.pcgRegularization * (pc.dt * pc.dt / particles[i].vi.w) * xi;
+
+            if (pc.mode == 0u)
+            {
+                float b = particles[i].pd.w + pc.dt * P.mass * delta - P.restDensity;
+                float r = b - Ax;
+                float z = particles[i].vi.w * r / (pc.dt * pc.dt);
+                rp[i] = vec2(r, z);                 // surfaceNbrThreshold = z0
+                sums  = vec4(r * z, abs(r), 0.0, 1.0);
+            }
+            else
+            {
+                solS[i] = Ax;
+                sums    = vec4(0.0, 0.0, rp[i].y * Ax, 0.0);
+            }
+        }
+        else
+        {
+            if (pc.mode == 0u)
+                rp[i] = vec2(0.0);
+            else
+                solS[i] = 0.0;
+        }
+    }
+
+    sh[lid] = sums;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1u)
+    {
+        if (lid < s)
+            sh[lid] += sh[lid + s];
+        barrier();
+    }
+    if (lid == 0u)
+    {
+        uint wg = gl_WorkGroupID.x;
+        if (pc.mode == 0u)
+        {
+            partials[4u * wg]      = sh[0].x;
+            partials[4u * wg + 1u] = sh[0].y;
+            partials[4u * wg + 3u] = sh[0].w;           // number of active particles of the group
+        }
+        else
+            partials[4u * wg + 2u] = sh[0].z;
+    }
+}

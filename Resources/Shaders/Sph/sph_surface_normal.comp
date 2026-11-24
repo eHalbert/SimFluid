@@ -1,0 +1,48 @@
+#version 450
+// Surface tension (Akinci 2013), pass 1: normal n_i = h * sum_j (m_j / rho_j) grad W_ij over the fluid neighbors.
+// Stored in scratch[i].pd.xyz (free between two sorts), read by sph_forces_acc.comp.
+layout(local_size_x = 256) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+    vec4 boxMin; vec4 boxMax; vec4 bLo; vec4 gravity;
+    ivec4 gridDim;
+    ivec4 bGridDim;
+    uint numFluid; uint numBoundary; uint maxNeighbors; uint minNbrDiv;
+    float h; float h2; float invH; float kernelK;
+    float kernelL; float W0; float mass; float sFull;
+    float invCell; float restDensity; float viscCoef; float viscEps;
+    float wallDamping; float surfaceNbrThreshold; float pcgRegularization; float pad;
+    vec4 cyl;
+} P;
+
+struct Particle { vec4 pd; vec4 vi; };
+layout(std430, set = 0, binding = 1) buffer Particles { Particle particles[]; };
+layout(std430, set = 0, binding = 2) buffer Scratch { Particle scratch[]; };
+layout(std430, set = 0, binding = 3) buffer Meta { uvec4 meta[]; };            // w = nbrCount
+layout(std430, set = 0, binding = 5) buffer NbrIdx { uint nbrIdx[]; };
+layout(std430, set = 0, binding = 6) buffer NbrGrad { float nbrGrad[]; };
+
+vec3 grad(uint k, uint i)
+{
+    uint o  = k * P.numFluid + i;
+    uint KN = P.maxNeighbors * P.numFluid;
+    return vec3(nbrGrad[o], nbrGrad[KN + o], nbrGrad[2u * KN + o]);
+}
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= P.numFluid)
+        return;
+
+    uint cnt = meta[i].w;
+    vec3 n = vec3(0.0);
+    for (uint k = 0u; k < cnt; ++k)
+    {
+        uint j = nbrIdx[k * P.numFluid + i];
+        if (j >= P.numFluid)
+            continue;                               // boundary particles do not take part
+        n += (P.mass / particles[j].pd.w) * grad(k, i);
+    }
+    scratch[i].pd = vec4(P.h * n, 0.0);
+}

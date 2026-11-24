@@ -1,0 +1,111 @@
+#version 450
+// Non-pressure acceleration: gravity + viscosity (Monaghan / Morris form, explicit).
+// Written to a separate buffer because it reads the velocities of the neighbors.
+layout(local_size_x = 256) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+    vec4 boxMin; vec4 boxMax; vec4 bLo; vec4 gravity;
+    ivec4 gridDim;
+    ivec4 bGridDim;
+    uint numFluid; uint numBoundary; uint maxNeighbors; uint minNbrDiv;
+    float h; float h2; float invH; float kernelK;
+    float kernelL; float W0; float mass; float sFull;
+    float invCell; float restDensity; float viscCoef; float viscEps;
+    float wallDamping; float surfaceNbrThreshold; float pcgRegularization; float pad;
+    vec4 cyl;
+} P;
+
+struct Particle { vec4 pd; vec4 vi; };
+layout(std430, set = 0, binding = 1) buffer Particles { Particle particles[]; };
+layout(std430, set = 0, binding = 2) buffer Scratch { Particle scratch[]; };    // normals (xyz), see sph_surface_normal.comp
+layout(std430, set = 0, binding = 3) buffer Meta { uvec4 meta[]; };
+layout(std430, set = 0, binding = 5) buffer NbrIdx { uint nbrIdx[]; };
+layout(std430, set = 0, binding = 6) buffer NbrGrad { float nbrGrad[]; };
+layout(std430, set = 0, binding = 9) buffer Acc { vec4 accBuf[]; };
+
+layout(push_constant) uniform PC {
+    float dt; float tol; uint divergence; uint minIt; uint maxIt; uint first; uint pad0; uint pad1;
+    vec4 curPos; vec4 curVel;
+    vec4 piston;        // w = surface tension coefficient gamma
+} pc;
+
+float cohesionKernel(float r)
+{
+    // Akinci 2013: 32 / (pi h^9) * { (h-r)^3 r^3 if 2r > h ; 2 (h-r)^3 r^3 - h^6 / 64 if 2r <= h }
+    float h = P.h;
+    if (r <= 0.0 || r >= h)
+        return 0.0;
+    float h3 = h * P.h2;
+    float t  = (h - r) * r;
+    float t3 = t * t * t;
+    float c  = 32.0 / (3.14159265 * h3 * h3 * h3);
+    return c * ((2.0 * r > h) ? t3 : 2.0 * t3 - (h3 * h3) / 64.0);
+}
+
+vec3 grad(uint k, uint i)
+{
+    uint o  = k * P.numFluid + i;
+    uint KN = P.maxNeighbors * P.numFluid;
+    return vec3(nbrGrad[o], nbrGrad[KN + o], nbrGrad[2u * KN + o]);
+}
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= P.numFluid)
+        return;
+
+    vec3  a     = P.gravity.xyz;
+    float gamma = pc.piston.w;
+    bool  bVisc = P.viscCoef > 0.0;
+    bool  bTens = gamma > 0.0;
+
+    if (bVisc || bTens)
+    {
+        vec3  xi   = particles[i].pd.xyz;
+        vec3  vi   = particles[i].vi.xyz;
+        float rhoi = particles[i].pd.w;
+        vec3  ni   = scratch[i].pd.xyz;
+        uint  cnt  = meta[i].w;
+
+        vec3 sumVisc = vec3(0.0);
+        vec3 sumTens = vec3(0.0);
+        for (uint k = 0u; k < cnt; ++k)
+        {
+            uint j = nbrIdx[k * P.numFluid + i];
+            if (j >= P.numFluid)
+                continue;                   // free-slip walls: no viscous force, no cohesion with boundary particles
+            vec4 pdj = particles[j].pd;
+            vec3 xij = xi - pdj.xyz;
+
+            if (bVisc)
+            {
+                vec3 vij = vi - particles[j].vi.xyz;
+                sumVisc += (P.mass / pdj.w) * dot(vij, xij) / (dot(xij, xij) + P.viscEps) * grad(k, i);
+            }
+            if (bTens)
+            {
+                float r = length(xij);
+                float K = 2.0 * P.restDensity / (rhoi + pdj.w);
+                vec3 coh  = (r > 1e-6) ? -P.mass * cohesionKernel(r) * (xij / r) : vec3(0.0);
+                vec3 curv = -(ni - scratch[j].pd.xyz);
+                sumTens += K * (coh + curv);
+            }
+        }
+        a += P.viscCoef * sumVisc + gamma * sumTens;
+    }
+
+    // Force cursor: drag the particles inside the sphere toward the cursor velocity
+    if (pc.curPos.w > 0.0)
+    {
+        vec3  d = particles[i].pd.xyz - pc.curPos.xyz;
+        float q = dot(d, d) / (pc.curPos.w * pc.curPos.w);
+        if (q < 1.0)
+        {
+            float w = (1.0 - q) * (1.0 - q);                    // smooth falloff, 1 at the center, 0 at the radius
+            a += pc.curVel.w * w * (pc.curVel.xyz - particles[i].vi.xyz);
+        }
+    }
+
+    accBuf[i] = vec4(a, 0.0);
+}

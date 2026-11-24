@@ -1,0 +1,37 @@
+#version 450
+// PCG: new search direction p = z + beta p, with z = invS / dt^2 * r (Jacobi preconditioner).
+// Own data only. Dispatched indirectly (0 groups once finished).
+layout(local_size_x = 256) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+
+    vec4 boxMin; vec4 boxMax; vec4 bLo; vec4 gravity;
+    ivec4 gridDim;
+    ivec4 bGridDim;
+    uint numFluid; uint numBoundary; uint maxNeighbors; uint minNbrDiv;
+    float h; float h2; float invH; float kernelK;
+    float kernelL; float W0; float mass; float sFull;
+    float invCell; float restDensity; float viscCoef; float viscEps;
+    float wallDamping; float surfaceNbrThreshold; float pcgRegularization; float pad;
+    vec4 cyl;
+} P;
+
+struct Particle { vec4 pd; vec4 vi; };
+layout(std430, set = 0, binding = 1)  buffer Particles { Particle particles[]; };
+layout(std430, set = 0, binding = 15) buffer Pcg { float scal[16]; vec2 rp[]; };
+
+layout(push_constant) uniform PC {
+    float dt; float tol; uint divergence; uint minIt; uint maxIt; uint flags; uint mode; float warmFactor;
+} pc;
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= P.numFluid)
+        return;
+
+    float beta = scal[2];
+    vec2  v    = rp[i];                             // (r, p)
+    float z    = particles[i].vi.w * v.x / (pc.dt * pc.dt);
+    rp[i].y    = z + beta * v.y;
+}

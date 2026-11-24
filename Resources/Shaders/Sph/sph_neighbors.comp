@@ -1,0 +1,205 @@
+#version 450
+// For every particle: neighbor list (fluid first, then boundary with index >= numFluid), kernel gradients,
+// density and DFSPH factor. The lists are cached because the solvers iterate over them many times.
+// Each invocation writes only the data of its own particle.
+layout(local_size_x = 256) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+    vec4 boxMin; vec4 boxMax; vec4 bLo; vec4 gravity;
+    ivec4 gridDim;
+    ivec4 bGridDim;
+    uint numFluid; uint numBoundary; uint maxNeighbors; uint minNbrDiv;
+    float h; float h2; float invH; float kernelK;
+    float kernelL; float W0; float mass; float sFull;
+    float invCell; float restDensity; float viscCoef; float viscEps;
+    float wallDamping; float surfaceNbrThreshold; float pcgRegularization; float pad;
+    vec4 cyl;
+} P;
+
+layout(push_constant) uniform PC {
+    float dt; float tol; uint divergence; uint minIt; uint maxIt; uint first; uint pad0; uint pad1;   // PushData (names differ per shader)
+    vec4 curPos; vec4 curVel;       // force cursor (unused here)
+    vec4 piston;                    // x = face position (m), y = velocity (m/s), z = enabled
+} pc;
+
+struct Particle { vec4 pd; vec4 vi; };
+layout(std430, set = 0, binding = 1) buffer Particles { Particle particles[]; };
+layout(std430, set = 0, binding = 3) buffer Meta { uvec4 meta[]; };            // z = nbrTotal, w = nbrCount
+layout(std430, set = 0, binding = 4) buffer CellStart { uint cellStart[]; };
+layout(std430, set = 0, binding = 5) buffer NbrIdx { uint nbrIdx[]; };
+layout(std430, set = 0, binding = 6) buffer NbrGrad { float nbrGrad[]; };       // 3 floats per neighbor
+layout(std430, set = 0, binding = 7) buffer BPos { vec4 bpos[]; };
+layout(std430, set = 0, binding = 8) buffer BCellStart { uint bCellStart[]; };
+
+// Per-invocation accumulators
+uint  gI;
+uint  gStored;
+uint  gTotal;
+float gSumW;
+vec3  gSumG;        // sum of grad W over all neighbors (fluid + boundary)
+float gSumG2;       // sum of |grad W|^2 over the fluid neighbors only
+
+void kernelWdW(float r, out float w, out float dw)
+{
+    // Cubic spline: W and dW/dr in one evaluation (r < h guaranteed by the caller)
+    float q = r * P.invH;
+    if (q <= 0.5)
+    {
+        w  = P.kernelK * (6.0 * (q * q * q - q * q) + 1.0);
+        dw = P.kernelL * q * (3.0 * q - 2.0) * P.invH;
+    }
+    else
+    {
+        float t = 1.0 - q;
+        w  = P.kernelK * 2.0 * t * t * t;
+        dw = -P.kernelL * t * t * P.invH;
+    }
+}
+
+void visit(uint j, vec3 d, float r2, bool fluid)
+{
+    float r = sqrt(r2);
+    float w, dw;
+    kernelWdW(r, w, dw);
+    gSumW += w;
+    ++gTotal;
+
+    vec3 g = vec3(0.0);
+    if (r > 1e-9)
+    {
+        g = (dw / r) * d;
+        gSumG += g;
+        if (fluid)
+            gSumG2 += dot(g, g);
+    }
+    if (gStored < P.maxNeighbors)
+    {
+        uint o  = gStored * P.numFluid + gI;            // neighbor-major layout: coalesced reads in the solvers
+        uint KN = P.maxNeighbors * P.numFluid;
+        nbrIdx[o]          = j;
+        nbrGrad[o]         = g.x;
+        nbrGrad[KN + o]    = g.y;
+        nbrGrad[2u * KN + o] = g.z;
+        ++gStored;
+    }
+}
+
+ivec3 cellCoord(vec3 p)
+{
+    return ivec3(clamp((p - P.boxMin.xyz) * P.invCell, vec3(0.0), vec3(P.gridDim.xyz - ivec3(1))));
+}
+
+uint cellLinear(int x, int y, int z)
+{
+    return uint(x + P.gridDim.x * (y + P.gridDim.y * z));
+}
+
+ivec3 bCellCoord(vec3 p)
+{
+    return ivec3(clamp((p - P.bLo.xyz) * P.invCell, vec3(0.0), vec3(P.bGridDim.xyz - ivec3(1))));
+}
+
+uint bCellLinear(int x, int y, int z)
+{
+    return uint(x + P.bGridDim.x * (y + P.bGridDim.y * z));
+}
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= P.numFluid)
+        return;
+
+    vec3 pos = particles[i].pd.xyz;
+    gI = i;
+    gStored = 0u;
+    gTotal  = 0u;
+    gSumW   = P.W0;             // self contribution
+    gSumG   = vec3(0.0);
+    gSumG2  = 0.0;
+
+    // Fluid neighbors. Cells along x are contiguous in memory -> only 9 ranges instead of 27 cells.
+    {
+        ivec3 c  = cellCoord(pos);
+        ivec3 lo = max(c - ivec3(1), ivec3(0));
+        ivec3 hi = min(c + ivec3(1), P.gridDim.xyz - ivec3(1));
+        for (int z = lo.z; z <= hi.z; ++z)
+        {
+            for (int y = lo.y; y <= hi.y; ++y)
+            {
+                uint begin = cellStart[cellLinear(lo.x, y, z)];
+                uint end   = cellStart[cellLinear(hi.x, y, z) + 1u];
+                for (uint j = begin; j < end; ++j)
+                {
+                    if (j == i)
+                        continue;
+                    vec3  d  = pos - particles[j].pd.xyz;
+                    float r2 = dot(d, d);
+                    if (r2 < P.h2)
+                        visit(j, d, r2, true);
+                }
+            }
+        }
+    }
+
+    // Moving piston (wave maker): boundary particles generated on the fly, on the wall lattice translated with the piston.
+    // Same lattice, same number of layers and same mass as the static walls built in BuildBoundary().
+    if (pc.piston.z > 0.5 && pos.x < pc.piston.x + P.h)
+    {
+        const float s  = P.pad;                                                          // spacing
+        const int   R  = int(ceil(P.h / s));                                            // layers = lattice cells covered by the kernel
+        const ivec2 nb = ivec2(floor((P.boxMax.yz - P.boxMin.yz) / s - 0.5)) + ivec2(1);// lattice points of the wall (y, z)
+        const ivec2 c0 = ivec2(floor((pos.yz - P.boxMin.yz) / s - 0.5));                // lattice index just below the particle
+        for (int k = 0; k < R; ++k)
+        {
+            const float bx = pc.piston.x - (float(k) + 0.5) * s;
+            const float dx = pos.x - bx;
+            if (dx * dx >= P.h2)
+                continue;
+            for (int a = max(c0.x - R + 1, 0); a <= min(c0.x + R, nb.x - 1); ++a)
+            {
+                for (int b = max(c0.y - R + 1, 0); b <= min(c0.y + R, nb.y - 1); ++b)
+                {
+                    const vec3  bp = vec3(bx, P.boxMin.y + (float(a) + 0.5) * s, P.boxMin.z + (float(b) + 0.5) * s);
+                    const vec3  d  = pos - bp;
+                    const float r2 = dot(d, d);
+                    if (r2 < P.h2)
+                        visit(P.numFluid + P.numBoundary, d, r2, false);    // index >= numFluid + numBoundary = piston
+                }
+            }
+        }
+    }
+
+    // Boundary neighbors (none if the particle is farther than h from every wall)
+    bool nearBox = any(lessThan(pos, P.boxMin.xyz + vec3(P.h))) || any(greaterThan(pos, P.boxMax.xyz - vec3(P.h)));
+    bool nearCyl = (P.cyl.w > 0.5) && (length(pos.xz - P.cyl.xy) < P.cyl.z + P.h);
+    if (nearBox || nearCyl)
+    {    
+        ivec3 c  = bCellCoord(pos);
+        ivec3 lo = max(c - ivec3(1), ivec3(0));
+        ivec3 hi = min(c + ivec3(1), P.bGridDim.xyz - ivec3(1));
+        for (int z = lo.z; z <= hi.z; ++z)
+        {
+            for (int y = lo.y; y <= hi.y; ++y)
+            {
+                uint begin = bCellStart[bCellLinear(lo.x, y, z)];
+                uint end   = bCellStart[bCellLinear(hi.x, y, z) + 1u];
+                for (uint j = begin; j < end; ++j)
+                {
+                    vec3  d  = pos - bpos[j].xyz;
+                    float r2 = dot(d, d);
+                    if (r2 < P.h2)
+                        visit(P.numFluid + j, d, r2, false);
+                }
+            }
+        }
+    }
+
+    particles[i].pd.w = P.mass * gSumW;             // density
+    meta[i].z = gTotal;
+    meta[i].w = gStored;
+
+    // DFSPH factor: 1 / (|sum m grad W|^2 + sum |m grad W|^2). Zero if degenerate (no pressure solve).
+    float S = P.mass * P.mass * (dot(gSumG, gSumG) + gSumG2);
+    particles[i].vi.w = (S > 1e-6 * P.sFull) ? 1.0 / S : 0.0;
+}

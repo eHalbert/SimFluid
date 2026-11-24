@@ -1,0 +1,44 @@
+#version 450
+// Counting sort, pass 1: cell index of every particle and rank of the particle inside its cell.
+layout(local_size_x = 256) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+
+    vec4 boxMin; vec4 boxMax; vec4 bLo; vec4 gravity;
+    ivec4 gridDim;
+    ivec4 bGridDim;
+    uint numFluid; uint numBoundary; uint maxNeighbors; uint minNbrDiv;
+    float h; float h2; float invH; float kernelK;
+    float kernelL; float W0; float mass; float sFull;
+    float invCell; float restDensity; float viscCoef; float viscEps;
+    float wallDamping; float surfaceNbrThreshold; float pcgRegularization; float pad;
+    vec4 cyl;
+} P;
+
+struct Particle { vec4 pd; vec4 vi; };
+layout(std430, set = 0, binding = 1) buffer Particles { Particle particles[]; };
+layout(std430, set = 0, binding = 3) buffer Meta { uvec4 meta[]; };            // x = cell, y = rank, z = nbrTotal, w = nbrCount
+layout(std430, set = 0, binding = 4) buffer CellStart { uint cellStart[]; };
+
+ivec3 cellCoord(vec3 p)
+{
+    // Clamp in float BEFORE converting to int
+    return ivec3(clamp((p - P.boxMin.xyz) * P.invCell, vec3(0.0), vec3(P.gridDim.xyz - ivec3(1))));
+}
+
+uint cellLinear(ivec3 c)
+{
+    return uint(c.x + P.gridDim.x * (c.y + P.gridDim.y * c.z));
+}
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= P.numFluid)
+        return;
+
+    uint cell = cellLinear(cellCoord(particles[i].pd.xyz));
+    uint rank = atomicAdd(cellStart[cell], 1u);
+    meta[i].x = cell;
+    meta[i].y = rank;
+}

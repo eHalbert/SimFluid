@@ -1,0 +1,35 @@
+#version 450
+// PCG, last step: velocity correction v -= dt * m * D(x) with D from sph_pcg_dir.comp (mode 2, clamped pressure),
+// then the pressure x >= 0 is kept in warm[] as the first guess of the next sub-step.
+layout(local_size_x = 256) in;
+
+layout(std140, set = 0, binding = 0) uniform Params {
+    vec4 boxMin; vec4 boxMax; vec4 bLo; vec4 gravity;
+    ivec4 gridDim;
+    ivec4 bGridDim;
+    uint numFluid; uint numBoundary; uint maxNeighbors; uint minNbrDiv;
+    float h; float h2; float invH; float kernelK;
+    float kernelL; float W0; float mass; float sFull;
+    float invCell; float restDensity; float viscCoef; float viscEps;
+    float wallDamping; float surfaceNbrThreshold; float pcgRegularization; float pad;
+    vec4 cyl;
+} P;
+
+struct Particle { vec4 pd; vec4 vi; };
+layout(std430, set = 0, binding = 1)  buffer Particles { Particle particles[]; };
+layout(std430, set = 0, binding = 9)  buffer Acc { vec4 accBuf[]; };
+layout(std430, set = 0, binding = 14) buffer Warm { float warmBuf[]; };
+
+layout(push_constant) uniform PC {
+    float dt; float tol; uint divergence; uint minIt; uint maxIt; uint flags; uint mode; float warmFactor;
+} pc;
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= P.numFluid)
+        return;
+
+    particles[i].vi.xyz -= (pc.dt * P.mass) * accBuf[i].xyz;
+    warmBuf[i] = max(warmBuf[i], 0.0);
+}

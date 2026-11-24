@@ -1,0 +1,15 @@
+#version 450
+// Exclusive prefix sum, step 2: add the (already scanned) block offset to every element of the block.
+layout(local_size_x = 256) in;
+
+layout(std430, set = 1, binding = 0) buffer Data { uint data[]; };
+layout(std430, set = 1, binding = 1) buffer Sums { uint sums[]; };
+layout(push_constant) uniform PC { uint n; } pc;
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    uint wg  = gl_WorkGroupID.x;
+    if (gid < pc.n && wg > 0u)
+        data[gid] += sums[wg];
+}
